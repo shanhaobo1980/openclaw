@@ -14,13 +14,18 @@ import { sendMediaFeishu } from "./media.js";
 import { addTypingIndicator, removeTypingIndicator, type TypingIndicatorState } from "./typing.js";
 
 /**
- * Lightweight fallback MEDIA: token extractor.
+ * Fallback MEDIA: token extractor.
  * Used when the upstream pipeline doesn't set mediaUrls on the payload
  * (e.g., during block streaming where final payloads may be dropped).
+ *
+ * Mirrors the validation rules in upstream src/media/parse.ts:
+ * - Rejects paths containing ".." (directory traversal)
+ * - Rejects paths with whitespace (unless quoted — not handled here for simplicity)
+ * - Accepts: http(s) URLs, relative paths (./), absolute unix (/), absolute Windows (C:\)
  */
-const MEDIA_TOKEN_RE = /\bMEDIA:\s*`?([^\n]+)`?/gi;
-
 function extractMediaFromText(text: string): { cleanedText: string; mediaUrls: string[] } {
+  // Use a local regex to avoid shared lastIndex state across calls
+  const mediaTokenRe = /\bMEDIA:\s*`?([^\n]+)`?/gi;
   const mediaUrls: string[] = [];
   const lines = text.split("\n");
   const keptLines: string[] = [];
@@ -32,7 +37,7 @@ function extractMediaFromText(text: string): { cleanedText: string; mediaUrls: s
       continue;
     }
 
-    const matches = Array.from(line.matchAll(MEDIA_TOKEN_RE));
+    const matches = Array.from(line.matchAll(mediaTokenRe));
     if (matches.length === 0) {
       keptLines.push(line);
       continue;
@@ -42,6 +47,10 @@ function extractMediaFromText(text: string): { cleanedText: string; mediaUrls: s
     for (const match of matches) {
       const raw = match[1].replace(/^[`"'[{(]+/, "").replace(/[`"'\\})\],]+$/, "").trim();
       if (!raw || raw.length > 4096) continue;
+      // Reject whitespace (consistent with upstream isValidMedia default)
+      if (/\s/.test(raw)) continue;
+      // Reject directory traversal
+      if (raw.includes("..")) continue;
       // Accept: http(s) URLs, relative paths, absolute unix/windows paths
       if (
         /^https?:\/\//i.test(raw) ||
@@ -49,10 +58,8 @@ function extractMediaFromText(text: string): { cleanedText: string; mediaUrls: s
         raw.startsWith("/") ||
         /^[a-zA-Z]:[/\\]/.test(raw)
       ) {
-        if (!raw.includes("..")) {
-          mediaUrls.push(raw);
-          foundValid = true;
-        }
+        mediaUrls.push(raw);
+        foundValid = true;
       }
     }
 
@@ -61,7 +68,8 @@ function extractMediaFromText(text: string): { cleanedText: string; mediaUrls: s
     }
   }
 
-  const cleanedText = keptLines.join("\n").replace(/\n{2,}/g, "\n").trim();
+  // Preserve paragraph breaks (double newlines) in cleaned text
+  const cleanedText = keptLines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
   return { cleanedText, mediaUrls };
 }
 
