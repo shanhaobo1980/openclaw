@@ -210,32 +210,50 @@ export async function uploadImageFeishu(params: {
 
   const client = createFeishuClient(account);
 
-  // SDK expects a Readable stream, not a Buffer
-  // Use type assertion since SDK actually accepts any Readable at runtime
-  const imageStream = typeof image === "string" ? fs.createReadStream(image) : Readable.from(image);
-
-  const response = await client.im.image.create({
-    data: {
-      image_type: imageType,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK stream type
-      image: imageStream as any,
-    },
-  });
-
-  // SDK v1.30+ returns data directly without code wrapper on success
-  // On error, it throws or returns { code, msg }
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK response type
-  const responseAny = response as any;
-  if (responseAny.code !== undefined && responseAny.code !== 0) {
-    throw new Error(`Feishu image upload failed: ${responseAny.msg || `code ${responseAny.code}`}`);
+  // form-data (used by Axios for multipart) cannot determine the length of
+  // a generic Readable created via Readable.from(buffer), which causes a
+  // zero-length upload.  Writing to a temp file and using fs.createReadStream
+  // gives form-data a .path it can fs.stat, so the upload works correctly.
+  let imageStream: fs.ReadStream;
+  let tmpPath: string | null = null;
+  if (typeof image === "string") {
+    imageStream = fs.createReadStream(image);
+  } else {
+    tmpPath = path.join(os.tmpdir(), `feishu_upload_${Date.now()}.img`);
+    await fs.promises.writeFile(tmpPath, image);
+    imageStream = fs.createReadStream(tmpPath);
   }
 
-  const imageKey = responseAny.image_key ?? responseAny.data?.image_key;
-  if (!imageKey) {
-    throw new Error("Feishu image upload failed: no image_key returned");
-  }
+  try {
+    const response = await client.im.image.create({
+      data: {
+        image_type: imageType,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK stream type
+        image: imageStream as any,
+      },
+    });
 
-  return { imageKey };
+    // SDK v1.30+ returns data directly without code wrapper on success
+    // On error, it throws or returns { code, msg }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK response type
+    const responseAny = response as any;
+    if (responseAny.code !== undefined && responseAny.code !== 0) {
+      throw new Error(
+        `Feishu image upload failed: ${responseAny.msg || `code ${responseAny.code}`}`,
+      );
+    }
+
+    const imageKey = responseAny.image_key ?? responseAny.data?.image_key;
+    if (!imageKey) {
+      throw new Error("Feishu image upload failed: no image_key returned");
+    }
+
+    return { imageKey };
+  } finally {
+    if (tmpPath) {
+      await fs.promises.unlink(tmpPath).catch(() => {});
+    }
+  }
 }
 
 /**
@@ -258,33 +276,48 @@ export async function uploadFileFeishu(params: {
 
   const client = createFeishuClient(account);
 
-  // SDK expects a Readable stream, not a Buffer
-  // Use type assertion since SDK actually accepts any Readable at runtime
-  const fileStream = typeof file === "string" ? fs.createReadStream(file) : Readable.from(file);
-
-  const response = await client.im.file.create({
-    data: {
-      file_type: fileType,
-      file_name: fileName,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK stream type
-      file: fileStream as any,
-      ...(duration !== undefined && { duration }),
-    },
-  });
-
-  // SDK v1.30+ returns data directly without code wrapper on success
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK response type
-  const responseAny = response as any;
-  if (responseAny.code !== undefined && responseAny.code !== 0) {
-    throw new Error(`Feishu file upload failed: ${responseAny.msg || `code ${responseAny.code}`}`);
+  // Same temp-file approach as uploadImageFeishu — see comment there.
+  let fileStream: fs.ReadStream;
+  let tmpPath: string | null = null;
+  if (typeof file === "string") {
+    fileStream = fs.createReadStream(file);
+  } else {
+    tmpPath = path.join(os.tmpdir(), `feishu_upload_${Date.now()}_${fileName}`);
+    await fs.promises.writeFile(tmpPath, file);
+    fileStream = fs.createReadStream(tmpPath);
   }
 
-  const fileKey = responseAny.file_key ?? responseAny.data?.file_key;
-  if (!fileKey) {
-    throw new Error("Feishu file upload failed: no file_key returned");
-  }
+  try {
+    const response = await client.im.file.create({
+      data: {
+        file_type: fileType,
+        file_name: fileName,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK stream type
+        file: fileStream as any,
+        ...(duration !== undefined && { duration }),
+      },
+    });
 
-  return { fileKey };
+    // SDK v1.30+ returns data directly without code wrapper on success
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK response type
+    const responseAny = response as any;
+    if (responseAny.code !== undefined && responseAny.code !== 0) {
+      throw new Error(
+        `Feishu file upload failed: ${responseAny.msg || `code ${responseAny.code}`}`,
+      );
+    }
+
+    const fileKey = responseAny.file_key ?? responseAny.data?.file_key;
+    if (!fileKey) {
+      throw new Error("Feishu file upload failed: no file_key returned");
+    }
+
+    return { fileKey };
+  } finally {
+    if (tmpPath) {
+      await fs.promises.unlink(tmpPath).catch(() => {});
+    }
+  }
 }
 
 /**

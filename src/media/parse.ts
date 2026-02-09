@@ -28,8 +28,24 @@ function isValidMedia(candidate: string, opts?: { allowSpaces?: boolean }) {
     return true;
   }
 
-  // Local paths: only allow safe relative paths starting with ./ that do not traverse upwards.
-  return candidate.startsWith("./") && !candidate.includes("..");
+  // Local paths: allow safe relative paths (./) and absolute paths (Unix / or Windows C:\).
+  // Block directory traversal in all cases.
+  if (candidate.includes("..")) {
+    return false;
+  }
+  // Relative paths starting with ./
+  if (candidate.startsWith("./")) {
+    return true;
+  }
+  // Absolute Unix paths
+  if (candidate.startsWith("/")) {
+    return true;
+  }
+  // Absolute Windows paths (e.g. C:\Users\... or D:\...)
+  if (/^[a-zA-Z]:[/\\]/.test(candidate)) {
+    return true;
+  }
+  return false;
 }
 
 function unwrapQuoted(value: string): string | undefined {

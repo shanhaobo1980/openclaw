@@ -10,7 +10,60 @@ import type { MentionTarget } from "./mention.js";
 import { resolveFeishuAccount } from "./accounts.js";
 import { getFeishuRuntime } from "./runtime.js";
 import { sendMessageFeishu, sendMarkdownCardFeishu } from "./send.js";
+import { sendMediaFeishu } from "./media.js";
 import { addTypingIndicator, removeTypingIndicator, type TypingIndicatorState } from "./typing.js";
+
+/**
+ * Lightweight fallback MEDIA: token extractor.
+ * Used when the upstream pipeline doesn't set mediaUrls on the payload
+ * (e.g., during block streaming where final payloads may be dropped).
+ */
+const MEDIA_TOKEN_RE = /\bMEDIA:\s*`?([^\n]+)`?/gi;
+
+function extractMediaFromText(text: string): { cleanedText: string; mediaUrls: string[] } {
+  const mediaUrls: string[] = [];
+  const lines = text.split("\n");
+  const keptLines: string[] = [];
+
+  for (const line of lines) {
+    const trimmedStart = line.trimStart();
+    if (!trimmedStart.startsWith("MEDIA:")) {
+      keptLines.push(line);
+      continue;
+    }
+
+    const matches = Array.from(line.matchAll(MEDIA_TOKEN_RE));
+    if (matches.length === 0) {
+      keptLines.push(line);
+      continue;
+    }
+
+    let foundValid = false;
+    for (const match of matches) {
+      const raw = match[1].replace(/^[`"'[{(]+/, "").replace(/[`"'\\})\],]+$/, "").trim();
+      if (!raw || raw.length > 4096) continue;
+      // Accept: http(s) URLs, relative paths, absolute unix/windows paths
+      if (
+        /^https?:\/\//i.test(raw) ||
+        raw.startsWith("./") ||
+        raw.startsWith("/") ||
+        /^[a-zA-Z]:[/\\]/.test(raw)
+      ) {
+        if (!raw.includes("..")) {
+          mediaUrls.push(raw);
+          foundValid = true;
+        }
+      }
+    }
+
+    if (!foundValid) {
+      keptLines.push(line);
+    }
+  }
+
+  const cleanedText = keptLines.join("\n").replace(/\n{2,}/g, "\n").trim();
+  return { cleanedText, mediaUrls };
+}
 
 /**
  * Detect if text contains markdown elements that benefit from card rendering.
@@ -109,9 +162,53 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       onReplyStart: typingCallbacks.onReplyStart,
       deliver: async (payload: ReplyPayload) => {
         params.runtime.log?.(
-          `feishu[${account.accountId}] deliver called: text=${payload.text?.slice(0, 100)}`,
+          `feishu[${account.accountId}] deliver called: text=${payload.text?.slice(0, 100)}, mediaUrls=${JSON.stringify(payload.mediaUrls)}, mediaUrl=${payload.mediaUrl}`,
         );
-        const text = payload.text ?? "";
+        let text = payload.text ?? "";
+        // Use pre-parsed mediaUrls from upstream, or fall back to inline extraction
+        let mediaUrls: string[] =
+          payload.mediaUrls ?? (payload.mediaUrl ? [payload.mediaUrl] : []);
+
+        // Fallback: if text contains MEDIA: tokens but mediaUrls is empty,
+        // parse them out (handles block streaming where final payloads may be dropped)
+        if (mediaUrls.length === 0 && text.includes("MEDIA:")) {
+          const extracted = extractMediaFromText(text);
+          if (extracted.mediaUrls.length > 0) {
+            mediaUrls = extracted.mediaUrls;
+            text = extracted.cleanedText;
+            params.runtime.log?.(
+              `feishu[${account.accountId}] deliver: extracted ${mediaUrls.length} media from text fallback`,
+            );
+          }
+        }
+
+        // Send media attachments if present
+        if (mediaUrls.length > 0) {
+          params.runtime.log?.(
+            `feishu[${account.accountId}] deliver: sending ${mediaUrls.length} media to ${chatId}`,
+          );
+          // Send text first (if any)
+          if (text.trim()) {
+            await sendMessageFeishu({ cfg, to: chatId, text, replyToMessageId, accountId });
+          }
+          for (const url of mediaUrls) {
+            try {
+              await sendMediaFeishu({ cfg, to: chatId, mediaUrl: url, accountId });
+            } catch (err) {
+              params.runtime.error?.(
+                `feishu[${account.accountId}] media send failed: ${String(err)}`,
+              );
+              await sendMessageFeishu({
+                cfg,
+                to: chatId,
+                text: `[media error] ${url}`,
+                accountId,
+              });
+            }
+          }
+          return;
+        }
+
         if (!text.trim()) {
           params.runtime.log?.(`feishu[${account.accountId}] deliver: empty text, skipping`);
           return;
